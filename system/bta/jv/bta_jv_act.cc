@@ -1491,6 +1491,9 @@ static void bta_jv_port_event_cl_cback(uint32_t code, uint16_t port_handle) {
   }
 
   if (code & PORT_EV_TXEMPTY) {
+    if (NULL != p_pcb->p_pm_cb) {
+      p_pcb->p_pm_cb->cong = false;
+    }
     bta_jv_pm_conn_idle(p_pcb->p_pm_cb);
   }
 }
@@ -1514,14 +1517,12 @@ void bta_jv_rfcomm_connect(tBTA_SEC sec_mask, uint8_t remote_scn,
           },
   };
 
-  if (com::android::bluetooth::flags::rfcomm_always_use_mitm()) {
     // Update security service record for RFCOMM client so that
     // secure RFCOMM connection will be authenticated with MTIM protection
     // while creating the L2CAP connection.
     get_btm_client_interface().security.BTM_SetSecurityLevel(
         true, "RFC_MUX", BTM_SEC_SERVICE_RFC_MUX, sec_mask, BT_PSM_RFCOMM,
         BTM_SEC_PROTO_RFCOMM, 0);
-  }
 
   if (RFCOMM_CreateConnectionWithSecurity(
           UUID_SERVCLASS_SERIAL_PORT, remote_scn, false, BTA_JV_DEF_RFC_MTU,
@@ -1739,6 +1740,9 @@ static void bta_jv_port_event_sr_cback(uint32_t code, uint16_t port_handle) {
   }
 
   if (code & PORT_EV_TXEMPTY) {
+    if (NULL != p_pcb->p_pm_cb) {
+      p_pcb->p_pm_cb->cong = false;
+    }
     bta_jv_pm_conn_idle(p_pcb->p_pm_cb);
   }
 }

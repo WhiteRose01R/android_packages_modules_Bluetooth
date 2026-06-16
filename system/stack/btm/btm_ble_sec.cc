@@ -36,7 +36,6 @@
 #include "btif/include/btif_storage.h"
 #include "crypto_toolbox/crypto_toolbox.h"
 #include "device/include/interop.h"
-#include "device/include/interop_config.h"
 #include "hci/controller_interface.h"
 #include "main/shim/entry.h"
 #include "os/log.h"
@@ -65,6 +64,7 @@
 #include "stack/include/gap_api.h"
 #include "stack/include/gatt_api.h"
 #include "stack/include/l2cap_security_interface.h"
+#include "stack/include/main_thread.h"
 #include "stack/include/smp_api.h"
 #include "stack/include/smp_api_types.h"
 #include "types/raw_address.h"
@@ -1083,7 +1083,7 @@ void btm_ble_link_sec_check(const RawAddress& bd_addr,
   }
 
   if (p_dev_rec->sec_rec.is_security_state_encrypting() ||
-      p_dev_rec->sec_rec.sec_state == BTM_SEC_STATE_AUTHENTICATING) {
+      p_dev_rec->sec_rec.le_link == tSECURITY_STATE::AUTHENTICATING) {
     /* race condition: discard the security request while central is encrypting
      * the link */
     *p_sec_req_act = BTM_BLE_SEC_REQ_ACT_DISCARD;
@@ -1157,11 +1157,10 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr,
   }
 
   switch (sec_act) {
-    if (p_rec->sec_rec.is_le_device_encrypted()) {
-      return BTM_SUCCESS;
-    }
-
     case BTM_BLE_SEC_ENCRYPT:
+      if (p_rec->sec_rec.is_le_device_encrypted()) {
+        return BTM_SUCCESS;
+      }
       if (link_role == HCI_ROLE_CENTRAL) {
         /* start link layer encryption using the security info stored */
         cmd = btm_ble_start_encrypt(bd_addr, false, NULL);
@@ -1191,7 +1190,7 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr,
 
       if (SMP_Pair(bd_addr) == SMP_STARTED) {
         cmd = BTM_CMD_STARTED;
-        p_rec->sec_rec.sec_state = BTM_SEC_STATE_AUTHENTICATING;
+        p_rec->sec_rec.le_link = tSECURITY_STATE::AUTHENTICATING;
       }
       break;
 
@@ -1200,6 +1199,35 @@ tBTM_STATUS btm_ble_set_encryption(const RawAddress& bd_addr,
       break;
   }
   return cmd;
+}
+
+/*******************************************************************************
+ *
+ * Function         btm_ble_handle_delayed_ltk_request
+ *
+ * Description      This function is called when encryption request is received
+ *                  on a peripheral device & this request is delayed by stack, because
+ *                  sec dev record null.
+ *
+ * Returns          void
+ *
+ ******************************************************************************/
+void btm_ble_handle_delayed_ltk_request(uint16_t handle, BT_OCTET8 rand,
+                                        uint16_t ediv) {
+  tBTM_SEC_CB* p_cb = &btm_sec_cb;
+  tBTM_SEC_DEV_REC* p_dev_rec = btm_find_dev_by_handle(handle);
+
+  log::verbose("handle:0x{:x}", handle);
+
+  p_cb->ediv = ediv;
+
+  memcpy(p_cb->enc_rand, rand, BT_OCTET8_LEN);
+
+  if (p_dev_rec != NULL) {
+    if (!smp_proc_ltk_request(p_dev_rec->bd_addr)) {
+      btm_ble_ltk_request_reply(p_dev_rec->bd_addr, false, Octet16{0});
+    }
+  }
 }
 
 /*******************************************************************************
@@ -1226,6 +1254,13 @@ void btm_ble_ltk_request(uint16_t handle, BT_OCTET8 rand, uint16_t ediv) {
   if (p_dev_rec != NULL) {
     if (!smp_proc_ltk_request(p_dev_rec->bd_addr)) {
       btm_ble_ltk_request_reply(p_dev_rec->bd_addr, false, Octet16{0});
+    }
+  } else {
+    bt_status_t status = do_in_main_thread_delayed(
+        FROM_HERE, base::Bind(&btm_ble_handle_delayed_ltk_request, handle, rand, ediv),
+        std::chrono::milliseconds(50));
+    if (status != BT_STATUS_SUCCESS) {
+      log::error("do_in_main_thread_delayed failed.");
     }
   }
 }
@@ -1272,8 +1307,9 @@ tBTM_STATUS btm_ble_start_encrypt(const RawAddress& bda, bool use_stk,
     return BTM_ERR_KEY_MISSING;
   }
 
-  if (p_rec->sec_rec.sec_state == BTM_SEC_STATE_IDLE)
-    p_rec->sec_rec.sec_state = BTM_SEC_STATE_LE_ENCRYPTING;
+  if (p_rec->sec_rec.le_link == tSECURITY_STATE::IDLE) {
+    p_rec->sec_rec.le_link = tSECURITY_STATE::ENCRYPTING;
+  }
 
   return BTM_CMD_STARTED;
 }
@@ -1343,7 +1379,7 @@ void btm_ble_link_encrypted(const RawAddress& bd_addr, uint8_t encr_enable) {
   if (encr_enable && p_dev_rec->sec_rec.enc_key_size == 0)
     p_dev_rec->sec_rec.enc_key_size = p_dev_rec->sec_rec.ble_keys.key_size;
 
-  p_dev_rec->sec_rec.sec_state = BTM_SEC_STATE_IDLE;
+  p_dev_rec->sec_rec.le_link = tSECURITY_STATE::IDLE;
   if (p_dev_rec->sec_rec.p_callback && enc_cback) {
     if (encr_enable) btm_sec_dev_rec_cback_event(p_dev_rec, BTM_SUCCESS, true);
     /* LTK missing on peripheral */
@@ -1592,21 +1628,25 @@ void btm_ble_connected(const RawAddress& bda, uint16_t handle,
 
 static bool btm_ble_complete_evt_ignore(const tBTM_SEC_DEV_REC* p_dev_rec,
                                         const tSMP_EVT_DATA* p_data) {
-  // Encryption request in peripheral role results in SMP Security request. SMP may generate a
-  // SMP_COMPLT_EVT failure event cases like below:
-  // 1) Some central devices don't handle cross-over between encryption and SMP security request
-  // 2) Link may get disconnected after the SMP security request was sent.
+  // Encryption request in peripheral role results in SMP Security request. SMP
+  // may generate a SMP_COMPLT_EVT failure event cases like below: 1) Some
+  // central devices don't handle cross-over between encryption and SMP security
+  // request 2) Link may get disconnected after the SMP security request was
+  // sent.
   if (p_data->cmplt.reason != SMP_SUCCESS && !p_dev_rec->role_central &&
       btm_sec_cb.pairing_bda != p_dev_rec->bd_addr &&
       btm_sec_cb.pairing_bda != p_dev_rec->ble.pseudo_addr &&
       p_dev_rec->sec_rec.is_le_link_key_known() &&
       p_dev_rec->sec_rec.ble_keys.key_type != BTM_LE_KEY_NONE) {
     if (p_dev_rec->sec_rec.is_le_device_encrypted()) {
-      log::warn("Bonded device {} is already encrypted, ignoring SMP failure", p_dev_rec->bd_addr);
+      log::warn("Bonded device {} is already encrypted, ignoring SMP failure",
+                p_dev_rec->bd_addr);
       return true;
     } else if (p_data->cmplt.reason == SMP_CONN_TOUT) {
-      log::warn("Bonded device {} disconnected while waiting for encryption, ignoring SMP failure",
-                p_dev_rec->bd_addr);
+      log::warn(
+          "Bonded device {} disconnected while waiting for encryption, "
+          "ignoring SMP failure",
+          p_dev_rec->bd_addr);
       l2cu_start_post_bond_timer(p_dev_rec->ble_hci_handle);
       return true;
     }
@@ -1614,7 +1654,6 @@ static bool btm_ble_complete_evt_ignore(const tBTM_SEC_DEV_REC* p_dev_rec,
 
   return false;
 }
-
 
 /*****************************************************************************
  *  Function        btm_proc_smp_cback
@@ -1662,12 +1701,16 @@ tBTM_STATUS btm_proc_smp_cback(tSMP_EVT event, const RawAddress& bd_addr,
         }
         btm_sec_cb.pairing_bda = bd_addr;
         if (event != SMP_CONSENT_REQ_EVT) {
-          p_dev_rec->sec_rec.sec_state = BTM_SEC_STATE_AUTHENTICATING;
+          p_dev_rec->sec_rec.le_link = tSECURITY_STATE::AUTHENTICATING;
         }
         btm_sec_cb.pairing_flags |= BTM_PAIR_FLAGS_LE_ACTIVE;
         FALLTHROUGH_INTENDED; /* FALLTHROUGH */
 
       case SMP_COMPLT_EVT:
+        if (event == SMP_COMPLT_EVT &&
+            btm_ble_complete_evt_ignore(p_dev_rec, p_data)) {
+          return BTM_SUCCESS;
+        }
         if (btm_sec_cb.api.p_le_callback) {
           /* the callback function implementation may change the IO
            * capability... */
@@ -1681,10 +1724,6 @@ tBTM_STATUS btm_proc_smp_cback(tSMP_EVT event, const RawAddress& bd_addr,
           p_dev_rec = btm_find_dev(bd_addr);
           if (p_dev_rec == NULL) {
             log::error("p_dev_rec is NULL");
-            return BTM_SUCCESS;
-          }
-
-          if (btm_ble_complete_evt_ignore(p_dev_rec, p_data)) {
             return BTM_SUCCESS;
           }
 
@@ -1728,7 +1767,7 @@ tBTM_STATUS btm_proc_smp_cback(tSMP_EVT event, const RawAddress& bd_addr,
           }
 
           if (res == BTM_SUCCESS) {
-            p_dev_rec->sec_rec.sec_state = BTM_SEC_STATE_IDLE;
+            p_dev_rec->sec_rec.le_link = tSECURITY_STATE::IDLE;
 
             if (p_dev_rec->sec_rec.bond_type != BOND_TYPE_TEMPORARY) {
               // Add all bonded device into resolving list if IRK is available.

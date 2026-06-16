@@ -208,6 +208,7 @@ public class LeAudioService extends ProfileService {
     Optional<Boolean> mQueuedInCallValue = Optional.empty();
     Optional<Integer> mBroadcastIdPendingStart = Optional.empty();
     Optional<Integer> mBroadcastIdPendingStop = Optional.empty();
+    Optional<Integer> mUnicastSourceStreamStatus = Optional.empty();
     BluetoothDevice mAudioManagerAddedOutDevice = null;
     boolean mInCall = false;
     boolean mTmapStarted = false;
@@ -510,8 +511,9 @@ public class LeAudioService extends ProfileService {
         }
         mNativeInterface.init(mLeAudioCodecConfig.getCodecConfigOffloading());
 
+        Log.d(TAG, "leaudioUseAudioModeListener is : " + leaudioUseAudioModeListener());
         if (leaudioUseAudioModeListener() && mAudioModeChangeListener != null) {
-          Log.i(TAG, "leaudioUseAudioModeListener is true, calling addOnModeChangedListener");
+          Log.i(TAG, "leaudioUseAudioModeListener is true, calling addOnModeChangedListener from start");
           mAudioManager.addOnModeChangedListener(getMainExecutor(), mAudioModeChangeListener);
         }
     }
@@ -529,8 +531,9 @@ public class LeAudioService extends ProfileService {
 
         mNativeInterface.init(mLeAudioCodecConfig.getCodecConfigOffloading());
 
+        Log.d(TAG, "leaudioUseAudioModeListener is : " + leaudioUseAudioModeListener());
         if (leaudioUseAudioModeListener() && mAudioModeChangeListener != null) {
-          Log.i(TAG, "leaudioUseAudioModeListener is true, calling addOnModeChangedListener");
+          Log.i(TAG, "leaudioUseAudioModeListener is true, calling addOnModeChangedListener from init");
           mAudioManager.addOnModeChangedListener(getMainExecutor(), mAudioModeChangeListener);
         }
     }
@@ -637,6 +640,7 @@ public class LeAudioService extends ProfileService {
         mBroadcastIdPendingStart = Optional.empty();
         mBroadcastIdPendingStop = Optional.empty();
         mAudioManagerAddedOutDevice = null;
+        mUnicastSourceStreamStatus = Optional.empty();
 
         // Set the service and BLE devices as inactive
         setLeAudioService(null);
@@ -839,7 +843,7 @@ public class LeAudioService extends ProfileService {
             Log.e(TAG, "Ignored disconnect request for " + device + " : no state machine");
             return false;
         }
-        setDisconnected(true);
+
         sm.sendMessage(LeAudioStateMachine.DISCONNECT);
 
         return true;
@@ -1489,6 +1493,7 @@ public class LeAudioService extends ProfileService {
         } else {
             if (mIsSourceStreamMonitorModeEnabled) {
                 mNativeInterface.setUnicastMonitorMode(LeAudioStackEvent.DIRECTION_SOURCE, false);
+                mUnicastSourceStreamStatus = Optional.empty();
             }
 
             mIsSourceStreamMonitorModeEnabled = false;
@@ -2928,6 +2933,12 @@ public class LeAudioService extends ProfileService {
             mNativeInterface.setUnicastMonitorMode(LeAudioStackEvent.DIRECTION_SOURCE, false);
         }
 
+        mUnicastSourceStreamStatus = Optional.of(status);
+        if (status == LeAudioStackEvent.STATUS_LOCAL_STREAM_SUSPENDED
+                && !isBroadcastAllowedToBeActivateInCurrentAudioMode()) {
+            Log.w(TAG, "handleSourceStreamStatusChange: broadcast not allowed in current mode");
+            return;
+        }
         bassClientService.handleUnicastSourceStreamStatusChange(status);
     }
 
@@ -3187,7 +3198,9 @@ public class LeAudioService extends ProfileService {
                 }
             }
             try {
-                mAudioServersScanner.startScan(filterList, settings, mScanCallback);
+                if (mScanCallback != null){
+                    mAudioServersScanner.startScan(filterList, settings, mScanCallback);
+                }
             } catch (IllegalStateException e) {
                 Log.e(TAG, "Fail to start scanner, consider it stopped", e);
                 mScanCallback = null;
@@ -3325,11 +3338,20 @@ public class LeAudioService extends ProfileService {
                         case LeAudioStackEvent.CONNECTION_STATE_DISCONNECTING:
                         case LeAudioStackEvent.CONNECTION_STATE_DISCONNECTED:
                             deviceDescriptor.mAclConnected = false;
-                            setDisconnected(true);
-                            synchronized(mScanCallbackLock) {
-                                Log.d(TAG, " try to start background scan");
-                                startAudioServersBackgroundScan(/* retry= */ false);
+
+                            if (descriptor.isActive()) {
+                                if (getConnectedPeerDevices(groupId).size() > 1) {
+                                    Log.d(TAG, "There are other connected group members.");
+                                } else {
+                                    setDisconnected(true);
+                                }
                             }
+                            mHandler.post(() -> {
+                                synchronized(mScanCallbackLock) {
+                                    Log.d(TAG, " try to start background scan");
+                                    startAudioServersBackgroundScan(/* retry= */ false);
+                                }
+                            });
 
                             boolean disconnectDueToUnbond =
                                     (BluetoothDevice.BOND_NONE
@@ -4142,6 +4164,8 @@ public class LeAudioService extends ProfileService {
                             false,
                             hasFallbackDevice,
                             false);
+                    Log.d(TAG, "Device updated had been done, reset mHasFallback");
+                    mHasFallback = true;
                     return;
                 }
             }
@@ -4313,7 +4337,9 @@ public class LeAudioService extends ProfileService {
 
         return descriptor.mInbandRingtoneEnabled;
     }
-
+    public boolean getInCall() {
+       return mInCall;
+    }
     /**
      * Set In Call state
      *
@@ -4882,6 +4908,12 @@ public class LeAudioService extends ProfileService {
                     handleUnicastStreamStatusChange(
                             LeAudioStackEvent.DIRECTION_SINK,
                             LeAudioStackEvent.STATUS_LOCAL_STREAM_SUSPENDED);
+                }
+
+                if (mUnicastSourceStreamStatus.isPresent()
+                        && (mUnicastSourceStreamStatus.get()
+                        == LeAudioStackEvent.STATUS_LOCAL_STREAM_SUSPENDED)) {
+                    handleSourceStreamStatusChange(mUnicastSourceStreamStatus.get());
                 }
                 break;
             default:
@@ -5749,7 +5781,18 @@ public class LeAudioService extends ProfileService {
             enforceBluetoothPrivilegedPermission(service);
             return service.groupAddNode(groupId, device);
         }
+        @Override
+        public boolean getInCall(AttributionSource source){
+            Objects.requireNonNull(source, "source cannot be null");
 
+            LeAudioService service = getService(source);
+            if (service == null) {
+                return false;
+            }
+
+            enforceBluetoothPrivilegedPermission(service);
+            return service.getInCall();
+        }
         @Override
         public void setInCall(boolean inCall, AttributionSource source) {
             Objects.requireNonNull(source, "source cannot be null");
